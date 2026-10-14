@@ -67,27 +67,27 @@ Freelancers and digital agencies face a universal challenge: **client communicat
 
 ```mermaid
 flowchart TD
-    Client["📱 WhatsApp Client (WhatsApp Web)"] -->|Encrypted WebSockets| WA["🤖 WhatsApp Web.js (Puppeteer)"]
-    WA -->|Normalized Message Stream| Server["⚡ Express Server & Ingest Pipeline"]
+    Client["WhatsApp Client - Web App"] -->|Encrypted WebSockets| WA["WhatsApp Web.js / Puppeteer"]
+    WA -->|Normalized Message Stream| Server["Express Server and Ingest Pipeline"]
     
-    subgraph Storage & Batching
-        Server -->|Reset 2-min Sliding Window| Batches[("📦 MongoDB pendingBatches")]
-        Server -->|Save Source Cache (7-Day TTL)| SrcMsg[("💬 MongoDB sourceMessages")]
-        Worker["⚙️ Background Sliding Batch Worker"] -->|Atomic Lease Lock| Batches
+    subgraph Storage_Batching ["Storage and Batching"]
+        Server -->|Reset 2-min Sliding Window| Batches[("MongoDB pendingBatches")]
+        Server -->|Save Source Cache 7-Day TTL| SrcMsg[("MongoDB sourceMessages")]
+        Worker["Background Sliding Batch Worker"] -->|Atomic Lease Lock| Batches
     end
 
-    subgraph Intelligence & Alerts
-        Worker -->|Batch Messages| Ollama["🦙 Local Ollama (LLaMA 3.2 / Gemma)"]
+    subgraph Intelligence_Alerts ["Intelligence and Alerts"]
+        Worker -->|Batch Messages| Ollama["Local Ollama - LLaMA 3.2 / Gemma"]
         Ollama -->|Structured JSON Brief| Worker
-        Worker -->|CRITICAL Urgency Detected| CallAlert["📞 CallAlertService"]
-        CallAlert -->|Synthesize Voice| 11Labs["🎙️ ElevenLabs API"]
-        CallAlert -->|Dispatch Phone Call| Twilio["☎️ Twilio Outbound Voice"]
-        Twilio -->|Ring Mobile Device| Phone["📲 Your Phone (+91...)"]
+        Worker -->|CRITICAL Urgency Detected| CallAlert["CallAlertService"]
+        CallAlert -->|Synthesize Voice| ElevenLabs["ElevenLabs API"]
+        CallAlert -->|Dispatch Phone Call| Twilio["Twilio Outbound Voice"]
+        Twilio -->|Ring Mobile Device| Phone["User Mobile Phone"]
     end
 
-    subgraph Dashboard UI
-        Worker -->|Socket.IO: summary:new, alert:call| WebApp["💻 Next.js 16 Web Dashboard"]
-        11Labs -->|In-Browser Audio Replay| WebApp
+    subgraph Dashboard_UI ["Dashboard UI"]
+        Worker -->|Real-time Socket.IO Events| WebApp["Next.js 16 Web Dashboard"]
+        ElevenLabs -->|In-Browser Audio Replay| WebApp
     end
 ```
 
@@ -206,9 +206,12 @@ BusinessBuddy/
 * **MongoDB**: Running locally at `mongodb://127.0.0.1:27017`
 * **Ollama**: Installed and running locally ([Download Ollama](https://ollama.com/))
   ```bash
-  # Pull the default local model
+  # 1. Start Ollama local inference engine (if not already running in background / system tray)
+  ollama serve
+
+  # 2. Pull the default local model
   ollama pull llama3.2:latest
-  # Or pull Gemma
+  # (Alternative lightweight model)
   ollama pull gemma:2b
   ```
 * **Google Chrome**: Installed on your system (used by Puppeteer for WhatsApp Web).
@@ -257,19 +260,23 @@ ALERT_PHONE_NUMBER=+918091983263
 
 ### Step 4: Run the Application
 
-In two separate terminal windows:
+#### Terminal 1 — Start Ollama (if not already running in background / system tray):
+```bash
+ollama serve
+```
+*(Runs the local open-weight AI inference server at `http://127.0.0.1:11434`).*
 
-#### Terminal 1 — Start the Backend Server:
+#### Terminal 2 — Start the Backend Server & Sliding-Window Batch Worker:
 ```bash
 npm run dev:server
 ```
-*(Runs at `http://127.0.0.1:3001` and connects to MongoDB, Ollama, and WhatsApp session).*
+*(Runs at `http://127.0.0.1:3001` and connects to MongoDB, Ollama, and your live WhatsApp Web session).*
 
-#### Terminal 2 — Start the Web Dashboard:
+#### Terminal 3 — Start the Next.js Web Dashboard:
 ```bash
 npm run dev:web
 ```
-*(Runs at `http://localhost:3000`).*
+*(Available at `http://localhost:3000`).*
 
 ---
 
