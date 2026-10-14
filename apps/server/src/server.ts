@@ -12,6 +12,9 @@ import { BatchWorker } from './worker.js';
 import { whatsappManager } from './whatsapp.js';
 import { NormalizedMessage, UserAccount, ContactPreference } from '@clientpulse/shared';
 import crypto from 'node:crypto';
+import fs from 'node:fs';
+import path from 'node:path';
+import { callAlertService } from './callAlert.js';
 
 dotenv.config();
 
@@ -21,7 +24,7 @@ const server = http.createServer(app);
 const PORT = process.env.PORT || 3001;
 const MONGODB_URI = process.env.MONGODB_URI || 'mongodb://127.0.0.1:27017/clientpulse';
 const OLLAMA_BASE_URL = process.env.OLLAMA_BASE_URL || 'http://127.0.0.1:11434';
-const OLLAMA_MODEL = process.env.OLLAMA_MODEL || 'gemma:2b';
+let OLLAMA_MODEL = process.env.OLLAMA_MODEL || 'llama3.2:latest';
 const JWT_SECRET = process.env.JWT_SECRET || 'clientpulse_secret_key_2026';
 
 const io = new SocketIOServer(server, {
@@ -75,12 +78,17 @@ app.post('/api/auth/register', async (req: Request, res: Response) => {
 
     const passwordHash = await bcrypt.hash(password, 10);
     const userId = `user_${crypto.randomUUID().slice(0, 8)}`;
+    const isWaConnected = whatsappManager.status === 'connected';
+    const waPhone = isWaConnected ? whatsappManager.phone || undefined : undefined;
+
     const newUser: UserAccount = {
       userId,
       email: email.toLowerCase(),
       passwordHash,
       name,
-      whatsappConnected: false,
+      whatsappConnected: isWaConnected,
+      whatsappPhone: waPhone,
+      monitoringMode: 'all',
       createdAt: new Date(),
     };
 
@@ -93,7 +101,9 @@ app.post('/api/auth/register', async (req: Request, res: Response) => {
         userId,
         email: newUser.email,
         name: newUser.name,
-        whatsappConnected: false,
+        whatsappConnected: isWaConnected,
+        whatsappPhone: waPhone,
+        monitoringMode: 'all',
       },
     });
   } catch (err: any) {
@@ -130,6 +140,7 @@ app.post('/api/auth/login', async (req: Request, res: Response) => {
         name: user.name,
         whatsappConnected: !!user.whatsappConnected,
         whatsappPhone: user.whatsappPhone,
+        monitoringMode: user.monitoringMode || 'all',
       },
     });
   } catch (err: any) {
@@ -151,8 +162,29 @@ app.get('/api/auth/me', authenticateToken, async (req: AuthRequest, res: Respons
         name: user.name,
         whatsappConnected: !!user.whatsappConnected,
         whatsappPhone: user.whatsappPhone,
+        monitoringMode: user.monitoringMode || 'all',
       },
     });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// 3.1 Update User Monitoring Mode ('all' vs 'selective')
+app.put('/api/user/monitoring-mode', authenticateToken, async (req: AuthRequest, res: Response) => {
+  try {
+    const db = getDb();
+    const { mode } = req.body;
+    if (mode !== 'all' && mode !== 'selective') {
+      return res.status(400).json({ error: 'Mode must be either "all" or "selective"' });
+    }
+
+    await db.collection<UserAccount>('users').updateOne(
+      { userId: req.user?.userId },
+      { $set: { monitoringMode: mode, updatedAt: new Date() } }
+    );
+
+    res.json({ success: true, monitoringMode: mode });
   } catch (err: any) {
     res.status(500).json({ error: err.message });
   }
@@ -231,18 +263,77 @@ app.get('/api/contacts', authenticateToken, async (req: AuthRequest, res: Respon
       .find({})
       .toArray();
 
-    const prefMap = new Map(storedPreferences.map((p) => [p.chatId, p]));
+    const resultMap = new Map<string, any>();
 
-    const result = chats.map((c) => {
-      const pref = prefMap.get(c.id);
-      return {
+    // 1. Add chats from WhatsApp session
+    for (const c of chats) {
+      resultMap.set(c.id, {
         chatId: c.id,
-        displayName: pref?.displayName || c.name,
-        enabled: pref !== undefined ? pref.enabled : true, // Default to monitored
+        displayName: c.name,
+        enabled: true,
         isGroup: c.isGroup,
-        projectScope: pref?.projectScope,
-        preferredTone: pref?.preferredTone,
-      };
+        lastMessageAt: c.lastMessageAt,
+        lastMessageText: c.lastMessageText,
+        lastMessageSender: c.lastMessageSender,
+      });
+    }
+
+    // 2. Merge with stored preferences, and include any manually added selective contacts
+    for (const p of storedPreferences) {
+      const existing = resultMap.get(p.chatId);
+      let latestMsgAt = p.lastMessageAt || existing?.lastMessageAt;
+      if (p.lastMessageAt && existing?.lastMessageAt) {
+        latestMsgAt = new Date(p.lastMessageAt) > new Date(existing.lastMessageAt)
+          ? p.lastMessageAt
+          : existing.lastMessageAt;
+      }
+
+      resultMap.set(p.chatId, {
+        chatId: p.chatId,
+        displayName: p.displayName || existing?.displayName || p.chatId,
+        enabled: p.enabled !== undefined ? p.enabled : true,
+        isGroup: p.isGroup !== undefined ? p.isGroup : existing?.isGroup || false,
+        projectScope: p.projectScope,
+        preferredTone: p.preferredTone,
+        lastMessageAt: latestMsgAt,
+        lastMessageText: p.lastMessageText || existing?.lastMessageText,
+        lastMessageSender: p.lastMessageSender || existing?.lastMessageSender,
+      });
+    }
+
+    const result = Array.from(resultMap.values());
+
+    // 3. For any contacts still missing lastMessageAt, check latest sourceMessage or summary in DB
+    for (const contact of result) {
+      if (!contact.lastMessageAt) {
+        const latestMsg = await db.collection('sourceMessages')
+          .find({ chatId: contact.chatId })
+          .sort({ timestamp: -1 })
+          .limit(1)
+          .next();
+        if (latestMsg) {
+          contact.lastMessageAt = latestMsg.timestamp;
+          contact.lastMessageText = contact.lastMessageText || latestMsg.text?.slice(0, 100);
+          contact.lastMessageSender = contact.lastMessageSender || latestMsg.senderName;
+        } else {
+          const latestSummary = await db.collection('summaries')
+            .find({ chatId: contact.chatId })
+            .sort({ createdAt: -1 })
+            .limit(1)
+            .next();
+          if (latestSummary) {
+            contact.lastMessageAt = latestSummary.windowEnd || latestSummary.createdAt;
+          }
+        }
+      }
+    }
+
+    // 4. Sort contacts descending according to the last message sent
+    result.sort((a, b) => {
+      const timeA = a.lastMessageAt ? new Date(a.lastMessageAt).getTime() : 0;
+      const timeB = b.lastMessageAt ? new Date(b.lastMessageAt).getTime() : 0;
+      if (timeB !== timeA) return timeB - timeA;
+      return (a.displayName || a.chatId).localeCompare(b.displayName || b.chatId);
     });
 
     res.json({ contacts: result });
@@ -272,7 +363,62 @@ app.put('/api/contacts/:chatId', authenticateToken, async (req: AuthRequest, res
       { upsert: true, returnDocument: 'after' }
     );
 
+    io.emit('contacts:updated');
     res.json({ success: true, contact: updated });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// 7.3 Manually add new contact (for Selective Monitoring Mode)
+app.post('/api/contacts', authenticateToken, async (req: AuthRequest, res: Response) => {
+  try {
+    const db = getDb();
+    let { phoneOrChatId, displayName, projectScope, preferredTone } = req.body;
+    if (!phoneOrChatId || !phoneOrChatId.trim()) {
+      return res.status(400).json({ error: 'Phone number or Chat ID is required' });
+    }
+
+    let cleanId = phoneOrChatId.trim();
+    if (!cleanId.includes('@')) {
+      const digitsOnly = cleanId.replace(/[^0-9]/g, '');
+      if (digitsOnly.length >= 7) {
+        cleanId = `${digitsOnly}@c.us`;
+      }
+    }
+
+    const contactDoc: ContactPreference = {
+      chatId: cleanId,
+      displayName: displayName?.trim() || cleanId.replace(/@.+/, ''),
+      enabled: true,
+      isGroup: cleanId.endsWith('@g.us'),
+      urgencySensitivity: 'standard',
+      projectScope: projectScope?.trim() || undefined,
+      preferredTone: preferredTone?.trim() || undefined,
+      lastMessageAt: new Date(),
+    };
+
+    await db.collection<ContactPreference>('contacts').updateOne(
+      { chatId: cleanId },
+      { $set: contactDoc },
+      { upsert: true }
+    );
+
+    io.emit('contacts:updated');
+    res.status(201).json({ success: true, contact: contactDoc });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// 7.4 Delete contact
+app.delete('/api/contacts/:chatId', authenticateToken, async (req: AuthRequest, res: Response) => {
+  try {
+    const db = getDb();
+    const chatId = req.params.chatId;
+    await db.collection<ContactPreference>('contacts').deleteOne({ chatId });
+    io.emit('contacts:updated');
+    res.json({ success: true, message: 'Contact removed' });
   } catch (err: any) {
     res.status(500).json({ error: err.message });
   }
@@ -375,14 +521,27 @@ app.post('/api/mock/incoming-message', authenticateToken, async (req: AuthReques
 
     const db = getDb();
 
-    // 1. Check if contact is muted
+    const user = await db.collection<UserAccount>('users').findOne({ userId });
+    const monitoringMode = user?.monitoringMode || 'all';
+
+    // 1. Check if contact is allowed per monitoring mode
     const contactPref = await db.collection<ContactPreference>('contacts').findOne({ chatId: targetChatId });
-    if (contactPref && contactPref.enabled === false) {
-      return res.status(200).json({
-        success: true,
-        ignored: true,
-        message: 'Message dropped: Contact is currently muted per your monitoring preferences.',
-      });
+    if (monitoringMode === 'selective') {
+      if (!contactPref || contactPref.enabled === false) {
+        return res.status(200).json({
+          success: true,
+          ignored: true,
+          message: 'Message dropped: Selective monitoring mode is active and this contact is not in your monitored list.',
+        });
+      }
+    } else {
+      if (contactPref && contactPref.enabled === false) {
+        return res.status(200).json({
+          success: true,
+          ignored: true,
+          message: 'Message dropped: Contact is currently muted per your monitoring preferences.',
+        });
+      }
     }
 
     const contactName = contactPref?.displayName || (
@@ -482,6 +641,136 @@ app.delete('/api/data', authenticateToken, async (req: AuthRequest, res: Respons
   }
 });
 
+// 16. Daily Executive Digest & Operations Metrics
+app.get('/api/digest/daily', authenticateToken, async (req: AuthRequest, res: Response) => {
+  try {
+    const db = getDb();
+    const userId = req.user!.userId;
+    const now = new Date();
+    const startOfDay = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+
+    const [todaySummaries, activeReminders] = await Promise.all([
+      db.collection('summaries')
+        .find({ accountId: userId, createdAt: { $gte: startOfDay } })
+        .sort({ createdAt: -1 })
+        .toArray(),
+      db.collection('reminders')
+        .find({ accountId: userId, status: { $ne: 'completed' } })
+        .sort({ createdAt: -1 })
+        .toArray(),
+    ]);
+
+    const totalBriefsToday = todaySummaries.length;
+    const criticalIncidents = todaySummaries.filter(
+      (s: any) => s.urgency === 'CRITICAL' || s.urgency === 'HIGH'
+    );
+    const scopeAlerts = todaySummaries.flatMap((s: any) =>
+      (s.openQuestions || []).filter((q: string) =>
+        q.toLowerCase().includes('scope alert') || q.toLowerCase().includes('scope check')
+      )
+    );
+    const activeClientsSet = new Set(todaySummaries.map((s: any) => s.contactName || s.chatId));
+
+    const clientBreakdown: Record<string, { briefsCount: number; hasCritical: boolean; lastActivity: Date }> = {};
+    for (const s of todaySummaries as any[]) {
+      const name = s.contactName || s.chatId;
+      if (!clientBreakdown[name]) {
+        clientBreakdown[name] = { briefsCount: 0, hasCritical: false, lastActivity: s.createdAt };
+      }
+      clientBreakdown[name].briefsCount += 1;
+      if (s.urgency === 'CRITICAL' || s.urgency === 'HIGH') {
+        clientBreakdown[name].hasCritical = true;
+      }
+    }
+
+    // Synthesize automated daily standup executive narrative
+    let standupReport = `Daily Operations Briefing (${startOfDay.toLocaleDateString()}):\n`;
+    standupReport += `- Processed ${totalBriefsToday} client communication bursts across ${activeClientsSet.size} active client(s).\n`;
+    if (criticalIncidents.length > 0) {
+      standupReport += `- ⚠️ ${criticalIncidents.length} critical / high-urgency event(s) addressed.\n`;
+    } else {
+      standupReport += `- All systems stable with no high-urgency client incidents.\n`;
+    }
+    if (activeReminders.length > 0) {
+      standupReport += `- ⏳ ${activeReminders.length} pending deadline(s) currently active.\n`;
+    }
+    if (scopeAlerts.length > 0) {
+      standupReport += `- 📋 ${scopeAlerts.length} scope advisory notice(s) flagged for change-order review.\n`;
+    }
+
+    res.json({
+      date: startOfDay.toISOString().slice(0, 10),
+      metrics: {
+        totalBriefsToday,
+        activeClientsCount: activeClientsSet.size,
+        criticalIncidentsCount: criticalIncidents.length,
+        pendingRemindersCount: activeReminders.length,
+        scopeAlertsCount: scopeAlerts.length,
+      },
+      standupReport,
+      criticalIncidents: criticalIncidents.map((s: any) => ({
+        client: s.contactName || s.chatId,
+        summary: s.summary,
+        urgency: s.urgency,
+        time: s.createdAt,
+      })),
+      upcomingDeadlines: activeReminders.slice(0, 5).map((r: any) => ({
+        title: r.title,
+        deadline: r.dateText,
+        client: r.contactName,
+      })),
+      scopeAlerts,
+      clientBreakdown,
+    });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// 17. ElevenLabs Alert Audio Stream
+app.get('/api/alerts/:summaryId/audio', (req: Request, res: Response) => {
+  const audio = callAlertService.getAudio(req.params.summaryId);
+  if (!audio) {
+    return res.status(404).json({ error: 'Audio not found or expired' });
+  }
+  res.setHeader('Content-Type', audio.contentType);
+  res.send(audio.buffer);
+});
+
+// 18. Test ElevenLabs Call Alert
+app.post('/api/alerts/test-call', authenticateToken, async (req: AuthRequest, res: Response) => {
+  try {
+    const { contactName, reason, phone } = req.body;
+    const testId = `test_alert_${Date.now()}`;
+    const result = await callAlertService.executeCriticalCallAlert(
+      {
+        summaryId: testId,
+        chatId: 'test_chat',
+        contactName: contactName || 'Aarav Sharma',
+        urgency: 'CRITICAL',
+        reason: reason || 'Production payment gateway outage reported on checkout page.',
+        time: new Date(),
+        summaryText: 'Client states payments are throwing error 500 on live store.',
+      },
+      phone
+    );
+
+    io.emit('alert:call', {
+      summaryId: testId,
+      chatId: 'test_chat',
+      contactName: contactName || 'Aarav Sharma',
+      urgency: 'CRITICAL',
+      reason: reason || 'Production payment gateway outage reported on checkout page.',
+      time: new Date(),
+      callResult: result,
+    });
+
+    res.json({ success: true, result });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // Socket.io Connection
 io.on('connection', (socket) => {
   socket.emit('whatsapp:status', { status: whatsappManager.status });
@@ -497,6 +786,20 @@ export async function startServer() {
     sourceRetentionMs: 7 * 24 * 60 * 60 * 1000,
   });
 
+  try {
+    const tagsRes = await fetch(`${OLLAMA_BASE_URL}/api/tags`);
+    if (tagsRes.ok) {
+      const tagsData = await tagsRes.json() as { models?: Array<{ name: string; model: string }> };
+      if (tagsData.models && tagsData.models.length > 0) {
+        const preferred = tagsData.models.find(m => m.name.includes('llama3.2') || m.name.includes('gemma'));
+        OLLAMA_MODEL = preferred ? preferred.name : tagsData.models[0].name;
+        console.log(`[Ollama] Connected to local Ollama. Active model: ${OLLAMA_MODEL}`);
+      }
+    }
+  } catch {
+    console.log('[Ollama] Local Ollama starting or offline; using resilient fallback engine');
+  }
+
   analyzer = new OllamaAnalyzer({
     baseUrl: OLLAMA_BASE_URL,
     model: OLLAMA_MODEL,
@@ -509,24 +812,71 @@ export async function startServer() {
   // Ingest live messages from real WhatsApp Web session
   whatsappManager.on('message', async (normalizedMsg) => {
     try {
-      // 1. Verify if chat is enabled/monitored
-      const contactPref = await db.collection<ContactPreference>('contacts').findOne({ chatId: normalizedMsg.chatId });
-      if (contactPref && contactPref.enabled === false) {
-        // Ignored: User opted out of monitoring this contact
-        return;
+      // 0. Fetch user to check monitoringMode
+      const user = await db.collection<UserAccount>('users').findOne({ whatsappConnected: true })
+                || await db.collection<UserAccount>('users').findOne({});
+      if (!user) return;
+
+      const monitoringMode = user.monitoringMode || 'all';
+
+      // 1. Check contact preference
+      let contactPref = await db.collection<ContactPreference>('contacts').findOne({ chatId: normalizedMsg.chatId });
+
+      if (monitoringMode === 'selective') {
+        // In Selective Mode: ONLY process if contact is explicitly in contacts list and enabled
+        if (!contactPref || contactPref.enabled === false) {
+          console.log(`[WhatsApp Selective Mode] Dropped message from unmonitored contact: ${normalizedMsg.chatId}`);
+          return;
+        }
+      } else {
+        // In All Contacts Mode: Automatically register contact if new, and process unless explicitly muted
+        if (!contactPref) {
+          const fallbackName = normalizedMsg.senderName || normalizedMsg.chatId.replace(/@.+/, '');
+          const newContact: ContactPreference = {
+            chatId: normalizedMsg.chatId,
+            displayName: fallbackName,
+            enabled: true,
+            isGroup: normalizedMsg.isGroupMessage,
+            urgencySensitivity: 'standard',
+            lastMessageAt: normalizedMsg.timestamp,
+            lastMessageText: normalizedMsg.text?.slice(0, 120),
+            lastMessageSender: normalizedMsg.senderName || 'Contact',
+          };
+          await db.collection<ContactPreference>('contacts').insertOne(newContact);
+          contactPref = newContact as any;
+          io.emit('contacts:updated');
+        }
+
+        if (contactPref && contactPref.enabled === false) {
+          console.log(`[WhatsApp] Ignored message from muted contact: ${normalizedMsg.chatId}`);
+          return;
+        }
       }
 
-      // 2. Route to active user
-      const user = await db.collection<UserAccount>('users').findOne({ whatsappConnected: true });
-      if (user) {
-        const contactName = contactPref?.displayName || normalizedMsg.senderName;
-        const result = await batchManager.ingestMessage(user.userId, normalizedMsg, contactName);
-        io.emit('message:incoming', {
-          message: normalizedMsg,
-          batchId: result.batchId,
-          isNewBatch: result.isNewBatch,
-        });
-      }
+      // 2. Route to active user and queue message
+      const contactName = contactPref?.displayName || normalizedMsg.senderName || normalizedMsg.chatId.replace(/@.+/, '');
+      const result = await batchManager.ingestMessage(user.userId, normalizedMsg, contactName);
+      console.log(`[Batch Ingest] Live WhatsApp message queued in batch ${result.batchId} for ${contactName}: "${normalizedMsg.text}"`);
+
+      // 3. Update contact's lastMessage metadata so contacts list sorts by latest message
+      await db.collection<ContactPreference>('contacts').updateOne(
+        { chatId: normalizedMsg.chatId },
+        {
+          $set: {
+            lastMessageAt: normalizedMsg.timestamp,
+            lastMessageText: normalizedMsg.text?.slice(0, 120),
+            lastMessageSender: normalizedMsg.senderName || 'Contact',
+          }
+        }
+      );
+      io.emit('contacts:updated');
+
+      io.emit('message:incoming', {
+        message: normalizedMsg,
+        batchId: result.batchId,
+        isNewBatch: result.isNewBatch,
+        contactName,
+      });
     } catch (err) {
       console.error('[WhatsApp Ingest Error]:', err);
     }
@@ -537,15 +887,27 @@ export async function startServer() {
   });
 
   whatsappManager.on('ready', async (data) => {
+    console.log(`[WhatsApp] Device ready & paired: ${data.phoneNumber}`);
     io.emit('whatsapp:status', { status: 'connected', phoneNumber: data.phoneNumber });
-    const user = await db.collection<UserAccount>('users').findOne({});
-    if (user) {
-      await db.collection<UserAccount>('users').updateOne(
-        { userId: user.userId },
-        { $set: { whatsappConnected: true, whatsappPhone: data.phoneNumber, updatedAt: new Date() } }
-      );
-    }
+    await db.collection<UserAccount>('users').updateMany(
+      {},
+      { $set: { whatsappConnected: true, whatsappPhone: data.phoneNumber, updatedAt: new Date() } }
+    );
   });
+
+  // Auto-restore existing WhatsApp session on server boot if saved credentials exist
+  const authDir = path.resolve(process.cwd(), '.wwebjs_auth');
+  const connectedUser = await db.collection<UserAccount>('users').findOne({ whatsappConnected: true });
+  if (connectedUser && fs.existsSync(authDir)) {
+    console.log('[WhatsApp] Existing session found. Initializing WhatsApp Web client in background...');
+    whatsappManager.requestConnect().then((res) => {
+      if (res.phoneNumber) {
+        console.log(`[WhatsApp] Restored existing live WhatsApp session: ${res.phoneNumber}`);
+      }
+    }).catch((err) => {
+      console.warn('[WhatsApp] Session auto-restore notice:', err.message);
+    });
+  }
 
   server.listen(PORT, () => {
     console.log(`[Server] Client Buddy backend listening on http://127.0.0.1:${PORT}`);

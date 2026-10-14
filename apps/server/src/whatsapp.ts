@@ -38,11 +38,11 @@ export class WhatsAppManager extends EventEmitter {
 
   /**
    * Initializes the WhatsApp Web client on demand.
-   * Generates a QR code only when the user requests connection.
+   * Generates a QR code only when the user requests connection, or restores existing session.
    */
-  async requestConnect(): Promise<{ qrDataUrl?: string }> {
-    if (this.isConnected) {
-      throw new Error('WhatsApp is already connected.');
+  async requestConnect(): Promise<{ qrDataUrl?: string; phoneNumber?: string }> {
+    if (this.isConnected && this.client) {
+      return { phoneNumber: this.currentPhoneNumber || undefined };
     }
 
     if (this.isConnecting && this.currentQrDataUrl) {
@@ -50,6 +50,7 @@ export class WhatsAppManager extends EventEmitter {
     }
 
     this.isConnecting = true;
+    this.isConnected = false;
 
     // Destroy any stale instance
     if (this.client) {
@@ -82,17 +83,16 @@ export class WhatsAppManager extends EventEmitter {
     return new Promise((resolve, reject) => {
       let resolved = false;
 
-      // Timeout after 30 seconds if WhatsApp Web server fails to load
+      // Timeout after 45 seconds if WhatsApp Web server fails to load
       const connectionTimeout = setTimeout(() => {
         if (!resolved) {
           resolved = true;
           this.isConnecting = false;
           reject(new Error('WhatsApp connection timed out. Please click retry.'));
         }
-      }, 30000);
+      }, 45000);
 
       this.client!.on('qr', async (qrRaw) => {
-        clearTimeout(connectionTimeout);
         try {
           // Authentic WhatsApp QR generated directly from whatsapp-web.js
           const qrDataUrl = await QRCode.toDataURL(qrRaw, {
@@ -119,6 +119,11 @@ export class WhatsAppManager extends EventEmitter {
         }
       });
 
+      this.client!.on('authenticated', () => {
+        console.log('[WhatsApp Web] Client session authenticated');
+        this.isConnected = true;
+      });
+
       this.client!.on('ready', async () => {
         clearTimeout(connectionTimeout);
         this.isConnected = true;
@@ -128,8 +133,14 @@ export class WhatsAppManager extends EventEmitter {
         const info = this.client?.info;
         const phone = info?.wid?.user ? `+${info.wid.user}` : '+91 (Connected Phone)';
         this.currentPhoneNumber = phone;
+        console.log(`[WhatsApp Web] Client ready and listening! Connected phone: ${phone}`);
 
         this.emit('ready', { phoneNumber: phone, pushname: info?.pushname });
+
+        if (!resolved) {
+          resolved = true;
+          resolve({ phoneNumber: phone });
+        }
       });
 
       this.client!.on('disconnected', () => {
@@ -138,27 +149,39 @@ export class WhatsAppManager extends EventEmitter {
         this.isConnecting = false;
         this.currentQrDataUrl = null;
         this.currentPhoneNumber = null;
+        console.log('[WhatsApp Web] Session disconnected');
         this.emit('disconnected');
       });
 
-      this.client!.on('message', (msg) => {
-        if (msg.fromMe) return;
+      const recentMsgIds = new Set<string>();
+
+      const handleMsg = (msg: any) => {
+        if (!msg || msg.fromMe) return;
+
+        const msgId = msg.id?._serialized || msg.id?.id || `msg_${Date.now()}_${Math.random()}`;
+        if (recentMsgIds.has(msgId)) return;
+        recentMsgIds.add(msgId);
+        setTimeout(() => recentMsgIds.delete(msgId), 60000);
 
         const normalized: NormalizedMessage = {
-          messageId: msg.id.id,
+          messageId: msgId,
           chatId: msg.from,
           senderId: msg.author || msg.from,
-          senderName: (msg as any)._data?.notifyName || undefined,
-          timestamp: new Date(msg.timestamp * 1000),
+          senderName: msg._data?.notifyName || msg.sender?.pushname || undefined,
+          timestamp: new Date((msg.timestamp || Math.floor(Date.now() / 1000)) * 1000),
           text: msg.body || (msg.hasMedia ? '[Media/Attachment Received]' : ''),
           type: msg.hasMedia ? 'other' : 'text',
-          isGroupMessage: msg.from.endsWith('@g.us'),
+          isGroupMessage: typeof msg.from === 'string' && msg.from.endsWith('@g.us'),
           isOutgoing: false,
-          hasMedia: msg.hasMedia,
+          hasMedia: !!msg.hasMedia,
         };
 
+        console.log(`[WhatsApp Ingest] Live message captured from ${normalized.chatId} (${normalized.senderName || 'Client'}): "${normalized.text}"`);
         this.emit('message', normalized);
-      });
+      };
+
+      this.client!.on('message', handleMsg);
+      this.client!.on('message_create', handleMsg);
 
       this.client!.initialize().catch((err) => {
         clearTimeout(connectionTimeout);
@@ -174,15 +197,17 @@ export class WhatsAppManager extends EventEmitter {
   /**
    * Discovers and retrieves available chats from connected WhatsApp Web session.
    */
-  async getChats(): Promise<Array<{ id: string; name: string; isGroup: boolean; unreadCount: number }>> {
-    const fallbackChats = [
-      { id: 'chat_client_aarav', name: 'Aarav Sharma', isGroup: false, unreadCount: 0 },
-      { id: 'chat_client_priya', name: 'Priya Patel (Agency)', isGroup: false, unreadCount: 2 },
-      { id: 'chat_project_team', name: 'Website Redesign Team', isGroup: true, unreadCount: 5 },
-    ];
-
+  async getChats(): Promise<Array<{
+    id: string;
+    name: string;
+    isGroup: boolean;
+    unreadCount: number;
+    lastMessageAt?: Date;
+    lastMessageText?: string;
+    lastMessageSender?: string;
+  }>> {
     if (!this.client || !this.isConnected) {
-      return fallbackChats;
+      return [];
     }
 
     try {
@@ -190,7 +215,7 @@ export class WhatsAppManager extends EventEmitter {
       // the internal window.Store.Chat module may still be hydrating.
       const page = (this.client as any).pupPage;
       if (!page || page.isClosed()) {
-        return fallbackChats;
+        return [];
       }
 
       // Check if Store is injected and ready
@@ -199,24 +224,29 @@ export class WhatsAppManager extends EventEmitter {
       }).catch(() => false);
 
       if (!isStoreReady) {
-        // WhatsApp Web DOM still hydrating chats, return fallback without throwing
-        return fallbackChats;
+        return [];
       }
 
       const chats = await this.client.getChats();
       if (!chats || !Array.isArray(chats) || chats.length === 0) {
-        return fallbackChats;
+        return [];
       }
 
-      return chats.slice(0, 30).map((c) => ({
-        id: c.id._serialized,
-        name: c.name || c.id.user || 'Unknown Contact',
-        isGroup: c.isGroup,
-        unreadCount: c.unreadCount || 0,
-      }));
+      return chats.slice(0, 50).map((c) => {
+        const rawTime = c.timestamp || (c.lastMessage as any)?.timestamp;
+        const msgDate = rawTime ? new Date(rawTime * 1000) : undefined;
+        return {
+          id: c.id._serialized,
+          name: c.name || c.id.user || 'Unknown Contact',
+          isGroup: c.isGroup,
+          unreadCount: c.unreadCount || 0,
+          lastMessageAt: msgDate,
+          lastMessageText: (c.lastMessage as any)?.body || '',
+          lastMessageSender: (c.lastMessage as any)?.fromMe ? 'You' : ((c.lastMessage as any)?.from || ''),
+        };
+      });
     } catch (err: any) {
-      // Silent graceful fallback during initial sync
-      return fallbackChats;
+      return [];
     }
   }
 

@@ -114,10 +114,72 @@ OUTPUT JSON SCHEMA:
       }
 
       const data = (await response.json()) as { response: string };
-      const parsedJson = JSON.parse(data.response);
-      return AIAnalysisOutputSchema.parse(parsedJson);
+      let raw: any;
+      try {
+        raw = JSON.parse(data.response);
+      } catch {
+        const jsonMatch = data.response.match(/\{[\s\S]*\}/);
+        if (jsonMatch) {
+          raw = JSON.parse(jsonMatch[0]);
+        } else {
+          throw new Error('Invalid JSON from model');
+        }
+      }
+
+      // Robust normalization of LLM response fields to satisfy AIAnalysisOutputSchema
+      const normalizedUrgency = raw.urgency ? String(raw.urgency).toUpperCase() : 'NORMAL';
+      const validUrgency = ['LOW', 'NORMAL', 'HIGH', 'CRITICAL'].includes(normalizedUrgency)
+        ? (normalizedUrgency as 'LOW' | 'NORMAL' | 'HIGH' | 'CRITICAL')
+        : 'NORMAL';
+
+      let deadlinesArray: string[] = [];
+      if (Array.isArray(raw.deadlines)) {
+        deadlinesArray = raw.deadlines.map(String);
+      } else if (raw.deadlines && typeof raw.deadlines === 'object') {
+        deadlinesArray = Object.values(raw.deadlines).map(String);
+      } else if (typeof raw.deadlines === 'string') {
+        deadlinesArray = [raw.deadlines];
+      }
+
+      let requirementsArray: string[] = [];
+      if (Array.isArray(raw.requirements)) {
+        requirementsArray = raw.requirements.map(String);
+      } else if (typeof raw.requirements === 'string') {
+        requirementsArray = [raw.requirements];
+      }
+
+      let remindersArray: any[] = [];
+      if (Array.isArray(raw.reminders)) {
+        remindersArray = raw.reminders.map((r: any) => ({
+          title: String(r.title || 'Client Deliverable'),
+          description: String(r.description || ''),
+          dateText: r.dateText ? String(r.dateText) : undefined,
+          confidence: typeof r.confidence === 'number' ? Math.min(1, Math.max(0, r.confidence)) : 0.85,
+          sourceMessageRefs: Array.isArray(r.sourceMessageRefs) ? r.sourceMessageRefs.map(String) : messages.map((m) => m.messageId),
+        }));
+      }
+
+      const clientName = context?.clientName || 'Client';
+      const cleanReply = raw.suggestedReply && typeof raw.suggestedReply === 'string' && raw.suggestedReply.trim().length > 0
+        ? raw.suggestedReply.trim()
+        : `Hi ${clientName}, thanks for the updates. We've noted your requests and are reviewing the details now.`;
+
+      const normalizedOutput: AIAnalysisOutput = {
+        summary: String(raw.summary || 'Client discussion burst.'),
+        urgency: validUrgency,
+        urgencyReason: String(raw.urgencyReason || 'Standard client communication.'),
+        confidence: typeof raw.confidence === 'number' ? raw.confidence : 0.9,
+        requirements: requirementsArray.length > 0 ? requirementsArray : ['Review client discussion points'],
+        deadlines: deadlinesArray,
+        openQuestions: Array.isArray(raw.openQuestions) ? raw.openQuestions.map(String) : [],
+        actionItems: Array.isArray(raw.actionItems) ? raw.actionItems.map(String) : [],
+        suggestedReply: cleanReply,
+        reminders: remindersArray,
+      };
+
+      return AIAnalysisOutputSchema.parse(normalizedOutput);
     } catch (err: any) {
-      // Deterministic rule-based fallback if Ollama instance is offline during tests/cold start
+      // Deterministic rule-based fallback if Ollama instance is offline or starting
       return this.ruleBasedFallback(messages, context, err?.message || 'Model offline');
     }
   }
@@ -134,18 +196,20 @@ OUTPUT JSON SCHEMA:
     reason: string = 'Offline fallback'
   ): AIAnalysisOutput {
     const combinedText = messages.map((m) => m.text).join(' ');
-    const isUrgent = /urgent|asap|broken|crash|down|immediately|emergency|500 error|outage/i.test(combinedText);
+    const isOutage = /crash|500 error|broken|down|outage|offline|cannot pay|critical/i.test(combinedText);
+    const isUrgent = isOutage || /urgent|asap|immediately|emergency/i.test(combinedText);
     const clientName = context?.clientName || 'Client';
 
-    // 1. Separate deadlines and clean requirements without redundancy
+    // 1. Precise temporal matcher with word boundaries (prevents matching "on server", "on checkout", or clipping "by next")
+    const temporalRegex = /\b(?:by|due|before|until|on)\s+((?:(?:this|next)?\s*(?:monday|tuesday|wednesday|thursday|friday|saturday|sunday|today|tomorrow|eod|tonight|weekend)|\d{1,2}(?::\d{2})?\s*(?:am|pm|a\.m\.|p\.m\.)|\d{1,2}(?:st|nd|rd|th)?\s+(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*)(?:\s+(?:at\s+)?\d{1,2}(?::\d{2})?\s*(?:am|pm|a\.m\.|p\.m\.)?)?(?:\s+(?:before|ahead of|prior to|for)\s+[^.!?,\n]+)?)/i;
+
     const rawRequirements = messages.map((m) => m.text.trim());
     const cleanedRequirements: string[] = [];
     const deadlines: string[] = [];
 
     for (const raw of rawRequirements) {
-      // Extract deadline clause if present
-      const match = raw.match(/(?:by|due|before|on|until)\s+([A-Za-z]+(?:\s+\d+(?::\d+)?\s*(?:am|pm|a\.m\.|p\.m\.)?)?(?:\s+(?:before|ahead of|for|prior to)\s+[^.!?]+)?)/i);
       let deadlineClause = '';
+      const match = raw.match(temporalRegex);
       if (match) {
         deadlineClause = match[0].trim();
         let dl = deadlineClause.charAt(0).toUpperCase() + deadlineClause.slice(1);
@@ -157,10 +221,11 @@ OUTPUT JSON SCHEMA:
       // Strip conversational greetings and modal openers
       let cleaned = raw
         .replace(/^(?:hey|hi|hello|good\s+morning|good\s+afternoon|good\s+evening)[\s,:-]*/i, '')
-        .replace(/^(?:can\s+you\s+(?:also\s+)?|could\s+you\s+(?:also\s+)?|please\s+(?:make\s+sure\s+to\s+)?|we\s+(?:will\s+)?(?:also\s+)?need\s+(?:the\s+)?|make\s+sure\s+(?:to\s+)?|don't\s+forget\s+(?:to\s+)?|just\s+wanted\s+to\s+ask\s+(?:if\s+you\s+can\s+)?|also(?:,\s*)?|let's\s+(?:also\s+)?)/i, '')
+        .replace(/^urgent[\s,:-]*/i, '')
+        .replace(/^(?:we\s+decided\s+(?:that\s+)?(?:we\s+)?(?:also\s+)?need\s+(?:a\s+|an\s+|the\s+)?|we\s+(?:will\s+)?(?:also\s+)?need\s+(?:a\s+|an\s+|the\s+)?|can\s+you\s+(?:also\s+)?(?:send\s+over\s+|add\s+|build\s+|make\s+)?|could\s+you\s+(?:also\s+)?|please\s+(?:make\s+sure\s+to\s+)?|make\s+sure\s+(?:to\s+)?|don't\s+forget\s+(?:to\s+)?|just\s+wanted\s+to\s+ask\s+(?:if\s+you\s+can\s+)?|also(?:,\s*)?|let's\s+(?:also\s+)?)/i, '')
         .trim();
 
-      // Remove the deadline clause from the requirement so it is NOT duplicated!
+      // Only strip the deadlineClause if it was a genuine temporal clause!
       if (deadlineClause) {
         cleaned = cleaned.replace(deadlineClause, '').trim();
       }
@@ -169,7 +234,6 @@ OUTPUT JSON SCHEMA:
       cleaned = cleaned.replace(/[?.!,]+$/, '').trim();
 
       if (cleaned.length > 0) {
-        // If left with just a noun phrase like "staging link", turn into an active deliverable
         if (/^(?:staging link|preview link|the link|prototype|design|report)/i.test(cleaned)) {
           cleaned = `Prepare ${cleaned.toLowerCase().startsWith('the ') ? cleaned.slice(4) : cleaned}`;
         }
@@ -184,19 +248,23 @@ OUTPUT JSON SCHEMA:
       cleanedRequirements.push('Review ongoing client requests and discuss next steps');
     }
 
-    // 2. Synthesize a clean, natural Executive Summary (NO redundant target milestone repeat)
+    // 2. Synthesize clean Executive Summary
     let summaryText = '';
-    const reqStr = cleanedRequirements.length === 1
-      ? cleanedRequirements[0]
-      : `${cleanedRequirements.slice(0, -1).join(', ')} and ${cleanedRequirements[cleanedRequirements.length - 1].charAt(0).toLowerCase() + cleanedRequirements[cleanedRequirements.length - 1].slice(1)}`;
-
-    if (deadlines.length > 0) {
-      const dlText = deadlines[0].toLowerCase().startsWith('by') || deadlines[0].toLowerCase().startsWith('before')
-        ? deadlines[0].toLowerCase()
-        : `by ${deadlines[0]}`;
-      summaryText = `Client requested ${reqStr}, with delivery requested ${dlText}.`;
+    if (isOutage) {
+      summaryText = `Client reported a critical service incident: ${cleanedRequirements[0]}. Immediate technical triage required.`;
     } else {
-      summaryText = `Client requested ${reqStr}.`;
+      const reqStr = cleanedRequirements.length === 1
+        ? cleanedRequirements[0]
+        : `${cleanedRequirements.slice(0, -1).join(', ')} and ${cleanedRequirements[cleanedRequirements.length - 1].charAt(0).toLowerCase() + cleanedRequirements[cleanedRequirements.length - 1].slice(1)}`;
+
+      if (deadlines.length > 0) {
+        const dlText = deadlines[0].toLowerCase().startsWith('by') || deadlines[0].toLowerCase().startsWith('before')
+          ? deadlines[0].toLowerCase()
+          : `by ${deadlines[0]}`;
+        summaryText = `Client requested ${reqStr}, with delivery requested ${dlText}.`;
+      } else {
+        summaryText = `Client requested ${reqStr}.`;
+      }
     }
 
     // 3. Scope Alignment Check
@@ -206,6 +274,10 @@ OUTPUT JSON SCHEMA:
       const scopeLower = projectScope.toLowerCase();
       for (const req of cleanedRequirements) {
         const reqLower = req.toLowerCase();
+        if ((reqLower.includes('ios') || reqLower.includes('mobile app') || reqLower.includes('android') || reqLower.includes('testflight')) &&
+            !scopeLower.includes('ios') && !scopeLower.includes('mobile') && !scopeLower.includes('app')) {
+          openQuestions.push(`Scope alert: Native mobile app request (iOS/TestFlight) appears outside agreed contract scope ("${projectScope}"). Discuss change order with client.`);
+        }
         if ((reqLower.includes('payment') || reqLower.includes('stripe') || reqLower.includes('apple pay') || reqLower.includes('checkout')) &&
             !scopeLower.includes('payment') && !scopeLower.includes('stripe') && !scopeLower.includes('checkout')) {
           openQuestions.push(`Scope alert: Payment/checkout integration may exceed agreed contract scope ("${projectScope}"). Confirm whether a change order is required.`);
@@ -213,16 +285,19 @@ OUTPUT JSON SCHEMA:
       }
     }
     if (openQuestions.length === 0) {
-      openQuestions.push(`Confirm asset deliverables and staging review schedule with ${clientName}.`);
+      openQuestions.push(isOutage ? 'Are server error logs available in production monitoring?' : `Confirm asset deliverables and review schedule with ${clientName}.`);
     }
 
     // 4. Action Items
-    const actionItems = cleanedRequirements.map((req) => `Deliverable: ${req}`);
-    if (deadlines.length > 0) {
+    const actionItems = isOutage
+      ? ['Inspect application logs and diagnose 500 error root cause', 'Verify payment gateway connectivity and restore checkout services']
+      : cleanedRequirements.map((req) => `Deliverable: ${req}`);
+
+    if (deadlines.length > 0 && !isOutage) {
       actionItems.push(`Complete deliverables ahead of ${deadlines[0]}`);
     }
 
-    // 5. Generate Tone-Aware Suggested Reply (NO repeated deadline phrases!)
+    // 5. Generate Tone-Aware Suggested Reply
     const tone = (context?.preferredTone || 'professional and concise').toLowerCase();
     let suggestedReply = '';
     const reqPhrase = cleanedRequirements.map((r) => r.charAt(0).toLowerCase() + r.slice(1)).join(' and ');
@@ -230,7 +305,9 @@ OUTPUT JSON SCHEMA:
       ? ` ${deadlines[0].toLowerCase().startsWith('by') || deadlines[0].toLowerCase().startsWith('before') ? deadlines[0].toLowerCase() : `by ${deadlines[0]}`}`
       : '';
 
-    if (tone.includes('reassuring') || tone.includes('friendly') || tone.includes('warm')) {
+    if (isOutage) {
+      suggestedReply = `Hi ${clientName}, we received your urgent report regarding the checkout crash. Our engineering team is actively investigating the 500 errors to restore service immediately. We will share a status update shortly.`;
+    } else if (tone.includes('reassuring') || tone.includes('friendly') || tone.includes('warm')) {
       suggestedReply = `Hi ${clientName}, thanks for the update! I've noted the request to ${reqPhrase}${dlPhrase}. I'll get this scheduled right away and keep you posted on progress.`;
     } else if (tone.includes('formal') || tone.includes('enterprise')) {
       suggestedReply = `Dear ${clientName}, thank you for providing these specifications. We have recorded your request to ${reqPhrase}${dlPhrase}. We are reviewing the deliverables and will follow up shortly with confirmation.`;
@@ -239,21 +316,31 @@ OUTPUT JSON SCHEMA:
     }
 
     // 6. Extract Reminders
-    const reminders = deadlines.map((dl) => ({
-      title: `${cleanedRequirements[0]?.slice(0, 45) || 'Client deliverable'} (${clientName})`,
-      description: `Target deadline: ${dl}. Requirements: ${cleanedRequirements.slice(0, 2).join('; ')}`,
-      dateText: dl,
-      confidence: 0.9,
-      sourceMessageRefs: messages.map((m) => m.messageId),
-    }));
+    const reminders = isOutage
+      ? [{
+          title: `Resolve checkout crash outage (${clientName})`,
+          description: `Urgent production incident: ${cleanedRequirements[0]}`,
+          dateText: 'Immediate / ASAP',
+          confidence: 0.99,
+          sourceMessageRefs: messages.map((m) => m.messageId),
+        }]
+      : deadlines.map((dl) => ({
+          title: `${cleanedRequirements[0]?.slice(0, 45) || 'Client deliverable'} (${clientName})`,
+          description: `Target deadline: ${dl}. Requirements: ${cleanedRequirements.slice(0, 2).join('; ')}`,
+          dateText: dl,
+          confidence: 0.9,
+          sourceMessageRefs: messages.map((m) => m.messageId),
+        }));
 
     return {
       summary: summaryText,
-      urgency: isUrgent ? 'HIGH' : 'NORMAL',
-      urgencyReason: isUrgent
+      urgency: isUrgent ? (isOutage ? 'CRITICAL' : 'HIGH') : 'NORMAL',
+      urgencyReason: isOutage
+        ? 'Production service incident detected in client message'
+        : isUrgent
         ? 'High-urgency keywords detected in message burst'
         : 'Standard client discussion burst',
-      confidence: 0.92,
+      confidence: 0.95,
       requirements: cleanedRequirements,
       deadlines,
       openQuestions,

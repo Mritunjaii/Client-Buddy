@@ -9,6 +9,7 @@ import {
 } from '@clientpulse/shared';
 import crypto from 'node:crypto';
 import { Server as SocketIOServer } from 'socket.io';
+import { callAlertService } from './callAlert.js';
 
 export class BatchWorker {
   private isRunning: boolean = false;
@@ -127,7 +128,32 @@ export class BatchWorker {
       // 6. Push real-time Socket.IO events if active
       if (this.io) {
         this.io.emit('summary:new', summaryRecord);
-        if (summaryRecord.urgency === 'HIGH' || summaryRecord.urgency === 'CRITICAL') {
+        if (summaryRecord.urgency === 'CRITICAL') {
+          // Trigger Outbound ElevenLabs Call Alert
+          callAlertService.executeCriticalCallAlert({
+            summaryId,
+            chatId: batch.chatId,
+            contactName: batch.contactName || 'Client',
+            urgency: 'CRITICAL',
+            reason: summaryRecord.urgencyReason,
+            time: now,
+            summaryText: summaryRecord.summary,
+          }).then((callRes) => {
+            if (this.io) {
+              this.io.emit('alert:call', {
+                summaryId,
+                chatId: batch.chatId,
+                contactName: batch.contactName || 'Client',
+                urgency: 'CRITICAL',
+                reason: summaryRecord.urgencyReason,
+                time: now,
+                callResult: callRes,
+              });
+            }
+          }).catch((err) => {
+            console.error('[Call Alert Error]:', err);
+          });
+
           this.io.emit('alert:urgent', {
             summaryId,
             chatId: batch.chatId,

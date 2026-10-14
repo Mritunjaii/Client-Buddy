@@ -8,6 +8,7 @@ export const UserAccountSchema = z.object({
   name: z.string(),
   whatsappConnected: z.boolean().default(false),
   whatsappPhone: z.string().optional(),
+  monitoringMode: z.enum(['all', 'selective']).default('all'),
   createdAt: z.coerce.date(),
   updatedAt: z.coerce.date().optional(),
 });
@@ -159,5 +160,9 @@ export const ContactPreferenceSchema = z.object({
   urgencySensitivity: z.enum(['low', 'standard', 'high']).default('standard'),
   projectScope: z.string().optional(),
   preferredTone: z.string().optional(),
+  lastMessageAt: z.coerce.date().optional(),
+  lastMessageText: z.string().optional(),
+  lastMessageSender: z.string().optional(),
 });
 export type ContactPreference = z.infer<typeof ContactPreferenceSchema>;
+
