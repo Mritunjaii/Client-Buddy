@@ -412,6 +412,23 @@ app.post('/api/mock/incoming-message', authenticateToken, async (req: AuthReques
   }
 });
 
+// 12.1 Immediately flush pending sliding window batch for instant testing
+app.post('/api/mock/flush-now', authenticateToken, async (req: AuthRequest, res: Response) => {
+  try {
+    const db = getDb();
+    const userId = req.user!.userId;
+    const { chatId } = req.body;
+    const filter: any = { accountId: userId, status: 'pending' };
+    if (chatId) filter.chatId = chatId;
+    const result = await db.collection('pendingBatches').updateMany(filter, {
+      $set: { flushAt: new Date() },
+    });
+    res.json({ success: true, modifiedCount: result.modifiedCount });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // 13. Export Data (GDPR / Privacy Compliance)
 app.get('/api/data/export', authenticateToken, async (req: AuthRequest, res: Response) => {
   try {

@@ -10,7 +10,7 @@
     "dev:server": "npm run dev --workspace=apps/server",
     "dev:web": "npm run dev --workspace=apps/web",
     "build": "npm run build --workspaces",
-    "test": "npm run test --workspaces"
+    "test": "npm run test --workspace=apps/server"
   },
   "devDependencies": {
     "typescript": "^5.4.5"

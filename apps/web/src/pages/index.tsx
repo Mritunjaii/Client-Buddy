@@ -339,6 +339,37 @@ export default function App() {
     }
   };
 
+  const updateContactProfile = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!editingContact || !token) return;
+    setSavingContact(true);
+    try {
+      const res = await fetch(`${BACKEND_URL}/api/contacts/${editingContact.chatId}`, {
+        method: 'PUT',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${token}`,
+        },
+        body: JSON.stringify({
+          displayName: editingContact.displayName,
+          enabled: editingContact.enabled,
+          projectScope: editingContact.projectScope,
+          preferredTone: editingContact.preferredTone,
+        }),
+      });
+      if (res.ok) {
+        setContacts((prev) =>
+          prev.map((c) => (c.chatId === editingContact.chatId ? editingContact : c))
+        );
+        setEditingContact(null);
+      }
+    } catch (err) {
+      console.error('Failed to update contact profile:', err);
+    } finally {
+      setSavingContact(false);
+    }
+  };
+
   const copyReply = (id: string, text: string) => {
     navigator.clipboard.writeText(text);
     setCopiedId(id);
@@ -412,6 +443,22 @@ export default function App() {
     }
   };
 
+  const flushBatchNow = async () => {
+    if (!token) return;
+    try {
+      await fetch(`${BACKEND_URL}/api/mock/flush-now`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${token}`,
+        },
+        body: JSON.stringify({ chatId: selectedChat }),
+      });
+    } catch (err) {
+      console.error(err);
+    }
+  };
+
   const exportData = async () => {
     try {
       const res = await fetch(`${BACKEND_URL}/api/data/export`, {
@@ -422,7 +469,7 @@ export default function App() {
       const url = URL.createObjectURL(blob);
       const a = document.createElement('a');
       a.href = url;
-      a.download = `clientpulse-export-${new Date().toISOString().slice(0, 10)}.json`;
+      a.download = `clientbuddy-export-${new Date().toISOString().slice(0, 10)}.json`;
       a.click();
       URL.revokeObjectURL(url);
     } catch (err) {
@@ -851,20 +898,37 @@ export default function App() {
                           <span className="text-[9px] bg-slate-800 text-slate-400 px-1 rounded">Group</span>
                         )}
                       </div>
-                      <button
-                        onClick={(e) => {
-                          e.stopPropagation();
-                          toggleContactMonitoring(contact.chatId, contact.enabled);
-                        }}
-                        className={`text-[10px] px-2 py-0.5 rounded border transition ${
-                          contact.enabled
-                            ? 'text-emerald-400 bg-emerald-950 border-emerald-800 hover:bg-emerald-900/50'
-                            : 'text-slate-500 bg-slate-950 border-slate-800 hover:text-slate-300'
-                        }`}
-                      >
-                        {contact.enabled ? 'Monitored' : 'Muted'}
-                      </button>
+                      <div className="flex items-center gap-1.5">
+                        <button
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            setEditingContact(contact);
+                          }}
+                          title="Configure client scope & tone profile"
+                          className="p-1 rounded text-slate-500 hover:text-slate-300 hover:bg-slate-800 transition"
+                        >
+                          <Settings className="w-3 h-3" />
+                        </button>
+                        <button
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            toggleContactMonitoring(contact.chatId, contact.enabled);
+                          }}
+                          className={`text-[10px] px-2 py-0.5 rounded border transition ${
+                            contact.enabled
+                              ? 'text-emerald-400 bg-emerald-950 border-emerald-800 hover:bg-emerald-900/50'
+                              : 'text-slate-500 bg-slate-950 border-slate-800 hover:text-slate-300'
+                          }`}
+                        >
+                          {contact.enabled ? 'Monitored' : 'Muted'}
+                        </button>
+                      </div>
                     </div>
+                    {contact.projectScope && (
+                      <p className="text-[11px] text-slate-400 mt-1 truncate">
+                        Scope: {contact.projectScope}
+                      </p>
+                    )}
                   </div>
                 ))}
             </div>
@@ -903,6 +967,16 @@ export default function App() {
                     className="px-3 py-1.5 bg-emerald-600 hover:bg-emerald-500 disabled:opacity-50 text-white rounded-lg font-medium flex items-center gap-1"
                   >
                     <Send className="w-3 h-3" /> Send
+                  </button>
+                </div>
+
+                <div className="pt-2">
+                  <button
+                    type="button"
+                    onClick={flushBatchNow}
+                    className="w-full text-center py-1.5 rounded-lg border border-slate-700 bg-slate-900/80 hover:bg-slate-800 text-[11px] text-amber-300 hover:text-amber-200 transition flex items-center justify-center gap-1.5 font-medium"
+                  >
+                    <Clock className="w-3 h-3 text-amber-400" /> Process Burst Now (Skip Wait)
                   </button>
                 </div>
               </form>
@@ -1151,4 +1225,142 @@ export default function App() {
 
             <div className="pt-2 border-t border-slate-800 text-right">
               <button
-                onClick={() => setInspectingSummaryId(
+                onClick={() => setInspectingSummaryId(null)}
+                className="px-4 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-xs text-white"
+              >
+                Done
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+      {/* Contact Context Profile Modal */}
+      {editingContact && (
+        <div className="fixed inset-0 bg-black/70 backdrop-blur-sm z-50 flex items-center justify-center p-4">
+          <div className="bg-slate-900 border border-slate-800 rounded-2xl w-full max-w-lg p-6 space-y-4 shadow-2xl">
+            <div className="flex items-center justify-between border-b border-slate-800 pb-3">
+              <div className="flex items-center gap-2">
+                <Settings className="w-4 h-4 text-emerald-400" />
+                <h3 className="font-bold text-sm text-white">
+                  Client Context Profile: {editingContact.displayName}
+                </h3>
+              </div>
+              <button
+                type="button"
+                onClick={() => setEditingContact(null)}
+                className="text-xs text-slate-400 hover:text-white"
+              >
+                Cancel
+              </button>
+            </div>
+
+            <form onSubmit={updateContactProfile} className="space-y-4">
+              <div>
+                <label className="block text-xs font-medium text-slate-300 mb-1">
+                  Client Display Name
+                </label>
+                <input
+                  type="text"
+                  value={editingContact.displayName}
+                  onChange={(e) =>
+                    setEditingContact({ ...editingContact, displayName: e.target.value })
+                  }
+                  required
+                  placeholder="e.g., Aarav Sharma"
+                  className="w-full bg-slate-950 border border-slate-800 focus:border-emerald-500 text-xs text-slate-200 rounded-xl px-3 py-2.5 focus:outline-none"
+                />
+              </div>
+
+              <div>
+                <label className="block text-xs font-medium text-slate-300 mb-1">
+                  Monitoring Status
+                </label>
+                <div className="flex gap-2">
+                  <button
+                    type="button"
+                    onClick={() =>
+                      setEditingContact({ ...editingContact, enabled: true })
+                    }
+                    className={`flex-1 py-2 rounded-xl text-xs font-semibold border transition ${
+                      editingContact.enabled
+                        ? 'bg-emerald-950 text-emerald-300 border-emerald-800'
+                        : 'bg-slate-950 text-slate-400 border-slate-800 hover:border-slate-700'
+                    }`}
+                  >
+                    Monitored (Active Analysis)
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() =>
+                      setEditingContact({ ...editingContact, enabled: false })
+                    }
+                    className={`flex-1 py-2 rounded-xl text-xs font-semibold border transition ${
+                      !editingContact.enabled
+                        ? 'bg-rose-950 text-rose-300 border-rose-800'
+                        : 'bg-slate-950 text-slate-400 border-slate-800 hover:border-slate-700'
+                    }`}
+                  >
+                    Muted (Ignored)
+                  </button>
+                </div>
+              </div>
+
+              <div>
+                <label className="block text-xs font-medium text-slate-300 mb-1">
+                  Agreed Project Scope
+                </label>
+                <textarea
+                  rows={3}
+                  value={editingContact.projectScope || ''}
+                  onChange={(e) =>
+                    setEditingContact({ ...editingContact, projectScope: e.target.value })
+                  }
+                  placeholder="e.g. Next.js web application redesign, 3 milestone reviews, out-of-scope backend migrations..."
+                  className="w-full bg-slate-950 border border-slate-800 focus:border-emerald-500 text-xs text-slate-200 rounded-xl px-3 py-2.5 focus:outline-none resize-none"
+                />
+                <p className="text-[11px] text-slate-500 mt-1">
+                  Injected into Gemma inference to flag scope creep and classify actionable deliverables.
+                </p>
+              </div>
+
+              <div>
+                <label className="block text-xs font-medium text-slate-300 mb-1">
+                  Preferred Reply Tone
+                </label>
+                <input
+                  type="text"
+                  value={editingContact.preferredTone || ''}
+                  onChange={(e) =>
+                    setEditingContact({ ...editingContact, preferredTone: e.target.value })
+                  }
+                  placeholder="e.g. Friendly & concise, Formal enterprise, Technical & direct"
+                  className="w-full bg-slate-950 border border-slate-800 focus:border-emerald-500 text-xs text-slate-200 rounded-xl px-3 py-2.5 focus:outline-none"
+                />
+                <p className="text-[11px] text-slate-500 mt-1">
+                  Gemma customizes manual reply drafts to match this communication style.
+                </p>
+              </div>
+
+              <div className="pt-3 border-t border-slate-800 flex justify-end gap-2">
+                <button
+                  type="button"
+                  onClick={() => setEditingContact(null)}
+                  className="px-4 py-2 rounded-xl bg-slate-800 hover:bg-slate-700 text-xs text-slate-300 transition"
+                >
+                  Cancel
+                </button>
+                <button
+                  type="submit"
+                  disabled={savingContact}
+                  className="px-4 py-2 rounded-xl bg-emerald-600 hover:bg-emerald-500 disabled:opacity-50 text-white font-semibold text-xs shadow-lg transition"
+                >
+                  {savingContact ? 'Saving...' : 'Save Context Profile'}
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}

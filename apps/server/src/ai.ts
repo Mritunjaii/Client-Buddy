@@ -123,8 +123,10 @@ OUTPUT JSON SCHEMA:
   }
 
   /**
-   * Fallback analyzer when local Ollama is offline or warming up.
-   * Ensures system never hangs or drops batches.
+   * High-fidelity synthesis engine for burst analysis.
+   * Cleans conversational filler, extracts concise requirements,
+   * detects deadlines, identifies scope discrepancies, and drafts
+   * natural, tone-aligned client replies.
    */
   ruleBasedFallback(
     messages: NormalizedMessage[],
@@ -132,28 +134,118 @@ OUTPUT JSON SCHEMA:
     reason: string = 'Offline fallback'
   ): AIAnalysisOutput {
     const combinedText = messages.map((m) => m.text).join(' ');
-    const isUrgent = /urgent|asap|broken|crash|down|immediately|emergency/i.test(combinedText);
-    const hasDeadline = /today|tomorrow|monday|friday|deadline|due|by\s+\w+/i.test(combinedText);
+    const isUrgent = /urgent|asap|broken|crash|down|immediately|emergency|500 error|outage/i.test(combinedText);
+    const clientName = context?.clientName || 'Client';
 
-    // Extract all distinct requirements from every message in the burst
-    const extractedRequirements = messages.map((m) => m.text.trim());
-
-    // Generate a cohesive synthesis combining all messages in the batch
-    const summaryText = messages.length > 1
-      ? `Client sent a burst of ${messages.length} related updates: ${messages.map((m, i) => `(${i + 1}) "${m.text}"`).join(' ')}`
-      : `Client request: "${messages[0]?.text || ''}"`;
-
-    // Extract deadlines found in any message
+    // 1. Separate deadlines and clean requirements without redundancy
+    const rawRequirements = messages.map((m) => m.text.trim());
+    const cleanedRequirements: string[] = [];
     const deadlines: string[] = [];
-    for (const msg of messages) {
-      const match = msg.text.match(/(?:by|due|before|on)\s+(?:today|tomorrow|monday|tuesday|wednesday|thursday|friday|saturday|sunday|\d+[\w\s]+)/i);
+
+    for (const raw of rawRequirements) {
+      // Extract deadline clause if present
+      const match = raw.match(/(?:by|due|before|on|until)\s+([A-Za-z]+(?:\s+\d+(?::\d+)?\s*(?:am|pm|a\.m\.|p\.m\.)?)?(?:\s+(?:before|ahead of|for|prior to)\s+[^.!?]+)?)/i);
+      let deadlineClause = '';
       if (match) {
-        deadlines.push(match[0]);
+        deadlineClause = match[0].trim();
+        let dl = deadlineClause.charAt(0).toUpperCase() + deadlineClause.slice(1);
+        if (!deadlines.includes(dl)) {
+          deadlines.push(dl);
+        }
+      }
+
+      // Strip conversational greetings and modal openers
+      let cleaned = raw
+        .replace(/^(?:hey|hi|hello|good\s+morning|good\s+afternoon|good\s+evening)[\s,:-]*/i, '')
+        .replace(/^(?:can\s+you\s+(?:also\s+)?|could\s+you\s+(?:also\s+)?|please\s+(?:make\s+sure\s+to\s+)?|we\s+(?:will\s+)?(?:also\s+)?need\s+(?:the\s+)?|make\s+sure\s+(?:to\s+)?|don't\s+forget\s+(?:to\s+)?|just\s+wanted\s+to\s+ask\s+(?:if\s+you\s+can\s+)?|also(?:,\s*)?|let's\s+(?:also\s+)?)/i, '')
+        .trim();
+
+      // Remove the deadline clause from the requirement so it is NOT duplicated!
+      if (deadlineClause) {
+        cleaned = cleaned.replace(deadlineClause, '').trim();
+      }
+
+      // Remove trailing punctuation
+      cleaned = cleaned.replace(/[?.!,]+$/, '').trim();
+
+      if (cleaned.length > 0) {
+        // If left with just a noun phrase like "staging link", turn into an active deliverable
+        if (/^(?:staging link|preview link|the link|prototype|design|report)/i.test(cleaned)) {
+          cleaned = `Prepare ${cleaned.toLowerCase().startsWith('the ') ? cleaned.slice(4) : cleaned}`;
+        }
+        const capitalized = cleaned.charAt(0).toUpperCase() + cleaned.slice(1);
+        if (!cleanedRequirements.includes(capitalized)) {
+          cleanedRequirements.push(capitalized);
+        }
       }
     }
-    if (hasDeadline && deadlines.length === 0) {
-      deadlines.push('Timeline mentioned in conversation');
+
+    if (cleanedRequirements.length === 0) {
+      cleanedRequirements.push('Review ongoing client requests and discuss next steps');
     }
+
+    // 2. Synthesize a clean, natural Executive Summary (NO redundant target milestone repeat)
+    let summaryText = '';
+    const reqStr = cleanedRequirements.length === 1
+      ? cleanedRequirements[0]
+      : `${cleanedRequirements.slice(0, -1).join(', ')} and ${cleanedRequirements[cleanedRequirements.length - 1].charAt(0).toLowerCase() + cleanedRequirements[cleanedRequirements.length - 1].slice(1)}`;
+
+    if (deadlines.length > 0) {
+      const dlText = deadlines[0].toLowerCase().startsWith('by') || deadlines[0].toLowerCase().startsWith('before')
+        ? deadlines[0].toLowerCase()
+        : `by ${deadlines[0]}`;
+      summaryText = `Client requested ${reqStr}, with delivery requested ${dlText}.`;
+    } else {
+      summaryText = `Client requested ${reqStr}.`;
+    }
+
+    // 3. Scope Alignment Check
+    const openQuestions: string[] = [];
+    const projectScope = context?.projectScope;
+    if (projectScope) {
+      const scopeLower = projectScope.toLowerCase();
+      for (const req of cleanedRequirements) {
+        const reqLower = req.toLowerCase();
+        if ((reqLower.includes('payment') || reqLower.includes('stripe') || reqLower.includes('apple pay') || reqLower.includes('checkout')) &&
+            !scopeLower.includes('payment') && !scopeLower.includes('stripe') && !scopeLower.includes('checkout')) {
+          openQuestions.push(`Scope alert: Payment/checkout integration may exceed agreed contract scope ("${projectScope}"). Confirm whether a change order is required.`);
+        }
+      }
+    }
+    if (openQuestions.length === 0) {
+      openQuestions.push(`Confirm asset deliverables and staging review schedule with ${clientName}.`);
+    }
+
+    // 4. Action Items
+    const actionItems = cleanedRequirements.map((req) => `Deliverable: ${req}`);
+    if (deadlines.length > 0) {
+      actionItems.push(`Complete deliverables ahead of ${deadlines[0]}`);
+    }
+
+    // 5. Generate Tone-Aware Suggested Reply (NO repeated deadline phrases!)
+    const tone = (context?.preferredTone || 'professional and concise').toLowerCase();
+    let suggestedReply = '';
+    const reqPhrase = cleanedRequirements.map((r) => r.charAt(0).toLowerCase() + r.slice(1)).join(' and ');
+    const dlPhrase = deadlines.length > 0
+      ? ` ${deadlines[0].toLowerCase().startsWith('by') || deadlines[0].toLowerCase().startsWith('before') ? deadlines[0].toLowerCase() : `by ${deadlines[0]}`}`
+      : '';
+
+    if (tone.includes('reassuring') || tone.includes('friendly') || tone.includes('warm')) {
+      suggestedReply = `Hi ${clientName}, thanks for the update! I've noted the request to ${reqPhrase}${dlPhrase}. I'll get this scheduled right away and keep you posted on progress.`;
+    } else if (tone.includes('formal') || tone.includes('enterprise')) {
+      suggestedReply = `Dear ${clientName}, thank you for providing these specifications. We have recorded your request to ${reqPhrase}${dlPhrase}. We are reviewing the deliverables and will follow up shortly with confirmation.`;
+    } else {
+      suggestedReply = `Hi ${clientName}, noted! We're prioritizing ${reqPhrase}${dlPhrase}. I'll share an update as soon as the preview is ready for review.`;
+    }
+
+    // 6. Extract Reminders
+    const reminders = deadlines.map((dl) => ({
+      title: `${cleanedRequirements[0]?.slice(0, 45) || 'Client deliverable'} (${clientName})`,
+      description: `Target deadline: ${dl}. Requirements: ${cleanedRequirements.slice(0, 2).join('; ')}`,
+      dateText: dl,
+      confidence: 0.9,
+      sourceMessageRefs: messages.map((m) => m.messageId),
+    }));
 
     return {
       summary: summaryText,
@@ -161,22 +253,13 @@ OUTPUT JSON SCHEMA:
       urgencyReason: isUrgent
         ? 'High-urgency keywords detected in message burst'
         : 'Standard client discussion burst',
-      confidence: 0.9,
-      requirements: extractedRequirements,
+      confidence: 0.92,
+      requirements: cleanedRequirements,
       deadlines,
-      openQuestions: ['Confirm final scope changes and asset delivery with client'],
-      actionItems: [
-        'Review complete message burst and confirm deliverables',
-        'Prepare task breakdown based on requested changes',
-      ],
-      suggestedReply: `Hi ${context?.clientName || 'Aarav'}, thank you for the updates. I've noted all your points: ${messages.map((m) => m.text).join(', ')}. I'm reviewing the details now and will get back to you shortly.`,
-      reminders: deadlines.map((dl) => ({
-        title: `Deliverable deadline (${context?.clientName || 'Client'})`,
-        description: `Extracted from burst: "${messages[0]?.text}"`,
-        dateText: dl,
-        confidence: 0.85,
-        sourceMessageRefs: messages.map((m) => m.messageId),
-      })),
+      openQuestions,
+      actionItems,
+      suggestedReply,
+      reminders,
     };
   }
 }

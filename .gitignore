@@ -9,6 +9,7 @@ out
 # WhatsApp session auth data (strictly private)
 .wwebjs_auth
 .wwebjs_cache
+.test_auth
 *.session
 
 # Logs
