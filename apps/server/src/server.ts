@@ -844,7 +844,6 @@ export async function startServer() {
           };
           await db.collection<ContactPreference>('contacts').insertOne(newContact);
           contactPref = newContact as any;
-          io.emit('contacts:updated');
         }
 
         if (contactPref && contactPref.enabled === false) {

@@ -54,6 +54,7 @@ export async function initIndexes(database: Db): Promise<void> {
 
   const contacts = database.collection<ContactPreference>('contacts');
   await contacts.createIndex({ chatId: 1 }, { unique: true });
+  await contacts.createIndex({ lastMessageAt: -1 });
 }
 
 export async function closeMongo(): Promise<void> {

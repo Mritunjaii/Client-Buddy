@@ -23,6 +23,9 @@ export interface CallAlertResult {
 // In-memory cache for synthesized ElevenLabs audio clips
 const audioCache = new Map<string, { buffer: Buffer; contentType: string; createdAt: Date }>();
 
+// Rate-limiting / deduplication cooldown for phone calls (max 1 call per chat per 3 mins)
+const callCooldownMap = new Map<string, number>();
+
 export class CallAlertService {
   private elevenLabsApiKey: string;
   private elevenLabsVoiceId: string;
@@ -213,10 +216,16 @@ export class CallAlertService {
       console.log(`[ElevenLabs] Successfully generated ${audioBuffer.length} bytes of realistic alert audio`);
     }
 
+    // Check 3-minute cooldown for outbound phone calls per chat
+    const nowMs = Date.now();
+    const lastCallTime = callCooldownMap.get(alertData.chatId);
+    const isCooldownActive = Boolean(lastCallTime && (nowMs - lastCallTime < 3 * 60 * 1000));
+
     // 2. Attempt ElevenLabs Conversational AI Outbound Call
-    if (this.isKeyConfigured(process.env.ELEVENLABS_AGENT_ID || this.elevenLabsAgentId)) {
+    if (!isCooldownActive && this.isKeyConfigured(process.env.ELEVENLABS_AGENT_ID || this.elevenLabsAgentId)) {
       const convRes = await this.placeElevenLabsConvAiCall(targetPhone, alertData);
       if (convRes.success) {
+        callCooldownMap.set(alertData.chatId, nowMs);
         return {
           success: true,
           provider: 'elevenlabs_convai',
@@ -228,9 +237,11 @@ export class CallAlertService {
     }
 
     // 3. Attempt Twilio Call with ElevenLabs Audio
-    if (this.isKeyConfigured(process.env.TWILIO_ACCOUNT_SID || this.twilioAccountSid)) {
+    let twilioErrorNotice: string | undefined;
+    if (!isCooldownActive && this.isKeyConfigured(process.env.TWILIO_ACCOUNT_SID || this.twilioAccountSid)) {
       const twilioRes = await this.placeTwilioPhoneCall(targetPhone, script);
       if (twilioRes.success) {
+        callCooldownMap.set(alertData.chatId, nowMs);
         return {
           success: true,
           provider: 'twilio_elevenlabs',
@@ -238,18 +249,29 @@ export class CallAlertService {
           audioBase64,
           message: `Outbound phone call placed to ${targetPhone} via Twilio (Call SID: ${twilioRes.sid})`,
         };
+      } else {
+        twilioErrorNotice = twilioRes.error;
       }
     }
 
-    // 4. Default / Simulated fallback mode (when user has placeholder keys in .env)
+    // 4. Default / Simulated fallback mode (when user has placeholder keys or trial limit)
+    let finalMessage = '';
+    if (isCooldownActive) {
+      finalMessage = `ElevenLabs voice synthesized! Outbound call on 3-min cooldown for this client to prevent duplicate ringing.`;
+    } else if (audioBuffer) {
+      finalMessage = twilioErrorNotice
+        ? `ElevenLabs voice synthesized! Twilio notice: ${twilioErrorNotice}`
+        : `ElevenLabs voice synthesized! Add Twilio credentials in .env to dispatch outbound GSM calls to ${targetPhone}.`;
+    } else {
+      finalMessage = `ElevenLabs Call Alert initialized for ${targetPhone}. Fill in your ELEVENLABS_API_KEY in apps/server/.env to activate live phone voice audio.`;
+    }
+
     return {
       success: true,
       provider: 'simulated_local',
       phoneCalled: targetPhone,
       audioBase64,
-      message: audioBuffer
-        ? `ElevenLabs voice synthesized! Add Twilio credentials in .env to dispatch outbound GSM calls to ${targetPhone}.`
-        : `ElevenLabs Call Alert initialized for ${targetPhone}. Fill in your ELEVENLABS_API_KEY in apps/server/.env to activate live phone voice audio.`,
+      message: finalMessage,
     };
   }
 

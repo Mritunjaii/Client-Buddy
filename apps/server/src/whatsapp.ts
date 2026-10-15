@@ -169,7 +169,7 @@ export class WhatsAppManager extends EventEmitter {
           senderId: msg.author || msg.from,
           senderName: msg._data?.notifyName || msg.sender?.pushname || undefined,
           timestamp: new Date((msg.timestamp || Math.floor(Date.now() / 1000)) * 1000),
-          text: msg.body || (msg.hasMedia ? '[Media/Attachment Received]' : ''),
+          text: msg.body?.trim() || msg.caption?.trim() || (msg.type === 'ptt' || msg.type === 'audio' ? '[Voice Note Received]' : msg.hasMedia ? '[Media Attachment Received]' : ''),
           type: msg.hasMedia ? 'other' : 'text',
           isGroupMessage: typeof msg.from === 'string' && msg.from.endsWith('@g.us'),
           isOutgoing: false,
